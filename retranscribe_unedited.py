@@ -40,6 +40,34 @@ class RetranscribeConfig(BaseSettings):
     wait_between_requests_secs: float = 0.5
 
 
+@dataclass
+class State:
+    already_completed_sessions: List[str]
+    last_sealed_date: datetime
+
+
+@dataclass
+class StateHandler:
+    state_pkl_path: str
+
+    def load(self) -> Optional[State]:
+        try:
+            with open(self.state_pkl_path, "rb") as f:
+                return pickle.load(f)
+        except FileNotFoundError:
+            return None
+
+    def save(self, state: State) -> None:
+        with open(self.state_pkl_path, "wb") as f:
+            pickle.dump(state, f)
+
+
+class StateConfig(BaseSettings):
+    state_pkl_path: str = "state.pkl"
+    load_state: bool = True
+    save_state: bool = True
+
+
 def _connect_to_mysql(host, port, database, user, password):
     """
     Connect to PostgreSQL database and return connection object.
@@ -76,7 +104,9 @@ def _fetch_data_by_session_id(connection, table_name, session_ids):
     return sessions
 
 
-def get_relevant_sessions(config: GetRelevantSessionsConfig) -> List[str]:
+def _get_relevant_sessions_from_snowflake(
+    config: GetRelevantSessionsConfig,
+) -> List[str]:
     connection_parameters = {
         "account": config.sf_account,
         "user": config.sf_user,
@@ -98,10 +128,10 @@ def get_relevant_sessions(config: GetRelevantSessionsConfig) -> List[str]:
     return session_ids
 
 
-def get_unedited_sessions(
+def _filter_unedited_sessions_using_mysql(
     sessions: List[str], config: FilterEditedSessionsConfig
 ) -> List[str]:
-    rds_conn = _connect_to_mysql(
+    mysql_conn = _connect_to_mysql(
         config.rds_host,
         config.rds_port,
         config.rds_database,
@@ -109,9 +139,9 @@ def get_unedited_sessions(
         config.rds_password,
     )
     edited_sessions = _fetch_data_by_session_id(
-        rds_conn, config.rds_sentences_table_fqdn, sessions
+        mysql_conn, config.rds_sentences_table_fqdn, sessions
     )
-    rds_conn.close()
+    mysql_conn.close()
     return list(filter(lambda session: session not in edited_sessions, sessions))
 
 
@@ -119,7 +149,7 @@ def _build_retranscribe_url(api_url: str, session_id: str) -> str:
     return f"{api_url}/{session_id}"
 
 
-def run_retranscribe(session_ids: List[str], config: RetranscribeConfig) -> None:
+def _run_retranscribe(session_ids: List[str], config: RetranscribeConfig) -> None:
     for session_id in tqdm(session_ids):
         url = _build_retranscribe_url(config.api_url, session_id)
         resp = requests.get(url)
@@ -130,58 +160,6 @@ def run_retranscribe(session_ids: List[str], config: RetranscribeConfig) -> None
             raise
         logger.info(f"Retranscribed session {session_id}")
         time.sleep(config.wait_between_requests_secs)
-
-
-@dataclass
-class State:
-    already_completed_sessions: List[str]
-    last_sealed_date: datetime
-
-
-@dataclass
-class StateHandler:
-    state_pkl_path: str
-
-    def load(self) -> Optional[State]:
-        try:
-            with open(self.state_pkl_path, "rb") as f:
-                return pickle.load(f)
-        except FileNotFoundError:
-            return None
-
-    def save(self, state: State) -> None:
-        with open(self.state_pkl_path, "wb") as f:
-            pickle.dump(state, f)
-
-
-class StateConfig(BaseSettings):
-    state_pkl_path: str = "state.pkl"
-    load_state: bool = True
-    save_state: bool = True
-
-
-def main() -> None:
-    now = datetime.now()
-    state_config = StateConfig()
-    state_handler = StateHandler(state_pkl_path=state_config.state_pkl_path)
-    get_relevant_sessions_config = GetRelevantSessionsConfig()
-    if state_config.load_state:
-        state = state_handler.load()
-        if state is not None:
-            get_relevant_sessions_config.already_completed_sessions = (
-                state.already_completed_sessions
-            )
-            get_relevant_sessions_config.start_date = state.last_sealed_date
-    sessions = get_relevant_sessions(get_relevant_sessions_config)
-    edited_sessions = get_unedited_sessions(sessions, FilterEditedSessionsConfig())
-    run_retranscribe(edited_sessions, RetranscribeConfig())
-    if state_config.save_state:
-        state = State(
-            already_completed_sessions=get_relevant_sessions_config.already_completed_sessions
-            + edited_sessions,
-            last_sealed_date=now,
-        )
-        state_handler.save(state)
 
 
 def _get_sf_query(date: datetime):
@@ -206,6 +184,32 @@ def _get_sf_query(date: datetime):
     """
 
     return sf_query_template.format(date=date_str)
+
+
+def main() -> None:
+    now = datetime.now()
+    state_config = StateConfig()
+    state_handler = StateHandler(state_pkl_path=state_config.state_pkl_path)
+    get_relevant_sessions_config = GetRelevantSessionsConfig()
+    if state_config.load_state:
+        state = state_handler.load()
+        if state is not None:
+            get_relevant_sessions_config.already_completed_sessions = (
+                state.already_completed_sessions
+            )
+            get_relevant_sessions_config.start_date = state.last_sealed_date
+    sessions = _get_relevant_sessions_from_snowflake(get_relevant_sessions_config)
+    edited_sessions = _filter_unedited_sessions_using_mysql(
+        sessions, FilterEditedSessionsConfig()
+    )
+    _run_retranscribe(edited_sessions, RetranscribeConfig())
+    if state_config.save_state:
+        state = State(
+            already_completed_sessions=get_relevant_sessions_config.already_completed_sessions
+            + edited_sessions,
+            last_sealed_date=now,
+        )
+        state_handler.save(state)
 
 
 if __name__ == "__main__":
