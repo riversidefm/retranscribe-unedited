@@ -1,4 +1,6 @@
+mysqlclient==2.2.4
 pydantic>=1.0,<2.0
 requests
 sqlalchemy
 snowflake-snowpark-python
+tqdm

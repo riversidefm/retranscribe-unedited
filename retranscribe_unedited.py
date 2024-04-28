@@ -1,6 +1,8 @@
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import pickle
 import time
-from typing import List
+from typing import List, Optional
 from pydantic import Field, BaseSettings
 import requests
 from snowflake.snowpark import Session
@@ -11,6 +13,7 @@ from tqdm import tqdm
 
 logger = Logger(__name__)
 
+
 class GetRelevantSessionsConfig(BaseSettings):
     sf_account: str
     sf_user: str
@@ -19,7 +22,7 @@ class GetRelevantSessionsConfig(BaseSettings):
     sf_warehouse: str = "COMPUTE_WH"
     sf_database: str = "SEGMENT_EVENTS"
     sf_schema: str = "WEB"
-    start_date: datetime = Field(default_factory=datetime.now)
+    start_date: datetime = Field(default_factory=lambda: datetime.now())
 
 
 class FilterEditedSessionsConfig(BaseSettings):
@@ -29,12 +32,11 @@ class FilterEditedSessionsConfig(BaseSettings):
     rds_user: str
     rds_password: str
     rds_sentences_table_fqdn: str = "transcriptions.sentences"
-    
+
+
 class RetranscribeConfig(BaseSettings):
-    api_url: str = 'https://riverside.fm/api/2/recordings/transcript'
+    api_url: str = "https://riverside.fm/api/2/recordings/transcript"
     wait_between_requests_secs: float = 0.5
-    
-    
 
 
 def _connect_to_mysql(host, port, database, user, password):
@@ -42,6 +44,7 @@ def _connect_to_mysql(host, port, database, user, password):
     Connect to PostgreSQL database and return connection object.
     """
     from sqlalchemy import create_engine
+
     db_url = f"mysql://{user}:{password}@{host}:{port}/{database}"
 
     try:
@@ -58,7 +61,6 @@ def _connect_to_mysql(host, port, database, user, password):
         raise
 
 
-
 def _fetch_data_by_session_id(connection, table_name, session_ids):
     """
     Fetch data from PostgreSQL table based on session_id.
@@ -69,7 +71,7 @@ def _fetch_data_by_session_id(connection, table_name, session_ids):
     result = connection.execute(text(query))
     sessions = [row[0] for row in result]
     return sessions
-    
+
 
 def get_relevant_sessions(config: GetRelevantSessionsConfig) -> List[str]:
     connection_parameters = {
@@ -108,6 +110,7 @@ def get_unedited_sessions(
 def _build_retranscribe_url(api_url: str, session_id: str) -> str:
     return f"{api_url}/{session_id}"
 
+
 def run_retranscribe(session_ids: List[str], config: RetranscribeConfig) -> None:
     for session_id in tqdm(session_ids):
         url = _build_retranscribe_url(config.api_url, session_id)
@@ -121,14 +124,46 @@ def run_retranscribe(session_ids: List[str], config: RetranscribeConfig) -> None
         time.sleep(config.wait_between_requests_secs)
 
 
+@dataclass
+class StateHandler:
+    state_pkl_path: str
+
+    def load(self) -> Optional[datetime]:
+        try:
+            with open(self.state_pkl_path, "rb") as f:
+                return pickle.load(f)
+        except FileNotFoundError:
+            return None
+
+    def save(self, state: datetime) -> None:
+        with open(self.state_pkl_path, "wb") as f:
+            pickle.dump(state, f)
+
+
+class StateConfig(BaseSettings):
+    state_pkl_path: str = "last_finish_date.pkl"
+    load_state: bool = False
+    save_state: bool = False
+
+
 def main() -> None:
+    now = datetime.now()
+    state_config = StateConfig()
+    state_handler = StateHandler(state_pkl_path=state_config.state_pkl_path)
+    get_relevant_sessions_config = GetRelevantSessionsConfig()
+    if state_config.load_state:
+        start_date = state_handler.load()
+        if start_date is not None:
+            get_relevant_sessions_config.start_date = start_date
     sessions = get_relevant_sessions(GetRelevantSessionsConfig())
     edited_sessions = get_unedited_sessions(sessions, FilterEditedSessionsConfig())
     run_retranscribe(edited_sessions, RetranscribeConfig())
+    if state_config.save_state:
+        state_handler.save(now)
 
 
 def _get_sf_query(date: datetime):
-    date_str = date.strftime("%Y-%m-%d")
+    date_str = date.strftime("%Y-%m-%d %H:%M:%S")
     sf_query_template = """
     SELECT 
         r.session_id, 
@@ -149,6 +184,7 @@ def _get_sf_query(date: datetime):
     """
 
     return sf_query_template.format(date=date_str)
+
 
 if __name__ == "__main__":
     main()
