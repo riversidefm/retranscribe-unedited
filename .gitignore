@@ -1,0 +1,4 @@
+.env
+package
+*.zip
+.python-version
